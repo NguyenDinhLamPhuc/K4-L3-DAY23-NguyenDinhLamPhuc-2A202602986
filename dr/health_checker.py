@@ -20,6 +20,7 @@ CÂU HỎI PHẢI TRẢ LỜI TRƯỚC KHI VIẾT (ghi câu trả lời vào rep
 """
 import argparse
 import json
+import math
 import pathlib
 import time
 
@@ -29,13 +30,57 @@ URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
 def probe(region: str, timeout: float) -> tuple[bool, str]:
-    """TODO: trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
-    raise NotImplementedError
+    """Kiểm tra readiness với timeout hữu hạn cho mỗi request."""
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout must be finite and positive")
+    try:
+        response = httpx.get(f"{URL[region]}/readyz", timeout=timeout)
+    except httpx.RequestError as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    return response.status_code == 200, f"/readyz HTTP {response.status_code}"
 
 
 def run(interval: float, timeout: float, threshold: int, duration: float, out: pathlib.Path):
-    """TODO: vòng lặp poll + phát hiện transition + ghi JSONL."""
-    raise NotImplementedError
+    """Poll hai region và ghi transition sau đủ số lần lỗi liên tiếp."""
+    for name, value in (("interval", interval), ("timeout", timeout)):
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be finite and positive")
+    if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 1:
+        raise ValueError("threshold must be a positive integer")
+    if not math.isfinite(duration) or duration < 0:
+        raise ValueError("duration must be finite and non-negative")
+
+    # Khởi đầu HEALTHY; chỉ tuyên bố outage khi đủ bằng chứng liên tiếp.
+    states = {region: "HEALTHY" for region in URL}
+    failures = {region: 0 for region in URL}
+    deadline = time.monotonic() + duration
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("a", encoding="utf-8") as log:
+        while time.monotonic() < deadline:
+            poll_started = time.monotonic()
+            for region in URL:
+                ready, reason = probe(region, timeout)
+                failures[region] = 0 if ready else failures[region] + 1
+                previous = states[region]
+                current = ("HEALTHY" if ready else
+                           "UNHEALTHY" if failures[region] >= threshold else previous)
+                if current != previous:
+                    log.write(json.dumps({
+                        "ts": time.time(),
+                        "event": "state_change",
+                        "region": region,
+                        "from": previous,
+                        "to": current,
+                        "reason": reason,
+                        "interval_s": interval,
+                        "threshold": threshold,
+                        "consecutive_fails": failures[region],
+                    }, ensure_ascii=False) + "\n")
+                    log.flush()
+                    states[region] = current
+            delay = min(poll_started + interval, deadline) - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
 
 
 if __name__ == "__main__":
